@@ -40,30 +40,30 @@ type Simple struct {
 	idleInstance   *list.List
 }
 
-func New(metaData *model2.Meta, config *config.Config) Scaler {
-	client, err := platform_client2.New(config.ClientAddr)
-	if err != nil {
-		log.Fatalf("client init with error: %s", err.Error())
-	}
-	scheduler := &Simple{
-		config:         config,
-		metaData:       metaData,
-		platformClient: client,
-		mu:             sync.Mutex{},
-		wg:             sync.WaitGroup{},
-		instances:      make(map[string]*model2.Instance),
-		idleInstance:   list.New(),
-	}
-	log.Printf("New scaler for app: %s is created", metaData.Key)
-	scheduler.wg.Add(1)
-	go func() {
-		defer scheduler.wg.Done()
-		scheduler.gcLoop()
-		log.Printf("gc loop for app: %s is stoped", metaData.Key)
-	}()
-
-	return scheduler
-}
+//func New(metaData *model2.Meta, config *config.Config) Scaler {
+//	client, err := platform_client2.New(config.ClientAddr)
+//	if err != nil {
+//		log.Fatalf("client init with error: %s", err.Error())
+//	}
+//	scheduler := &Simple{
+//		config:         config,
+//		metaData:       metaData,
+//		platformClient: client,
+//		mu:             sync.Mutex{},
+//		wg:             sync.WaitGroup{},
+//		instances:      make(map[string]*model2.Instance),
+//		idleInstance:   list.New(),
+//	}
+//	log.Printf("New scaler for app: %s is created", metaData.Key)
+//	scheduler.wg.Add(1)
+//	go func() {
+//		defer scheduler.wg.Done()
+//		scheduler.gcLoop()
+//		log.Printf("gc loop for app: %s is stoped", metaData.Key)
+//	}()
+//
+//	return scheduler
+//}
 
 func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
 	start := time.Now()
@@ -90,7 +90,6 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 			ErrorMessage: nil,
 		}, nil
 	}
-	s.mu.Unlock()
 
 	//Create new Instance
 	resourceConfig := model2.SlotResourceConfig{
