@@ -26,3 +26,6 @@ docker-build: proto
 proto:
 	cd proto && protoc -I ./  serverless-sim.proto --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative && cd -
 
+deploy:
+	kubectl apply -f ../manifest/serverless-simulaion.yaml
+

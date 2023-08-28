@@ -20,7 +20,7 @@ type Config struct {
 	GcInterval           time.Duration
 	IdleDurationBeforeGC time.Duration
 	BatchSize            int
-	MaxIdlePct           float64
+	IdlePct              float64
 }
 
 var DefaultConfig = Config{
@@ -28,5 +28,5 @@ var DefaultConfig = Config{
 	GcInterval:           10 * time.Second,
 	IdleDurationBeforeGC: 5 * time.Minute,
 	BatchSize:            2,
-	MaxIdlePct:           0.1,
+	IdlePct:              0.1,
 }
