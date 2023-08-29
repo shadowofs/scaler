@@ -7,13 +7,13 @@ import (
 	"github.com/AliyunContainerService/scaler/go/pkg/config"
 	model2 "github.com/AliyunContainerService/scaler/go/pkg/model"
 	platform_client2 "github.com/AliyunContainerService/scaler/go/pkg/platform_client"
+	"github.com/AliyunContainerService/scaler/go/pkg/util"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"log"
 	"math"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	pb "github.com/AliyunContainerService/scaler/proto"
@@ -28,8 +28,8 @@ type Adaptive struct {
 	instances      map[string]*model2.Instance
 	idleInstance   *list.List
 	insAvailable   *sync.Cond
-	waitedReq      chan *pb.AssignRequest
-	runningIns     atomic.Uint64
+	waitedReq      chan string
+	runningIns     util.AtomicInt32
 	logger         *log.Logger
 }
 
@@ -38,6 +38,11 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 	if err != nil {
 		log.Fatalf("client init with error: %s", err.Error())
 	}
+
+	return NewWithClient(metaData, config, client)
+}
+
+func NewWithClient(metaData *model2.Meta, config *config.Config, client platform_client2.Client) Scaler {
 	lock := sync.Mutex{}
 	scheduler := &Adaptive{
 		config:         config,
@@ -47,34 +52,44 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 		instances:      make(map[string]*model2.Instance),
 		idleInstance:   list.New(),
 		insAvailable:   sync.NewCond(&lock),
-		waitedReq:      make(chan *pb.AssignRequest, 1),
-		runningIns:     atomic.Uint64{},
-		logger:         log.New(os.Stdout, fmt.Sprintf("app=%s", metaData.Key), log.Ldate|log.Ltime|log.Lshortfile|log.Lmsgprefix),
+		waitedReq:      make(chan string, 1),
+		logger:         log.New(os.Stdout, fmt.Sprintf("app=%s, ", metaData.Key), log.Ldate|log.Ltime|log.Lshortfile|log.Lmsgprefix),
 	}
 	log.Printf("New scaler for app: %s is created", metaData.Key)
 	go func() {
-		scheduler.instanceAdaptLoop()
-		scheduler.logger.Printf("gc loop for app: %s is stoped", metaData.Key)
+		scheduler.insAdaptLoop()
+		scheduler.logger.Printf("gc loop for app: %s is stopped", metaData.Key)
 	}()
 
 	return scheduler
 }
 
-func (s *Adaptive) PopIdleInstance(request *pb.AssignRequest, blocking bool) *model2.Instance {
+func (s *Adaptive) PopIdleInstance(ctx context.Context, reqId string) *model2.Instance {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var element *list.Element
-	for element = s.idleInstance.Front(); element == nil; {
-		if !blocking {
+	element := s.idleInstance.Front()
+	if element == nil {
+		s.logger.Printf("requestId=%s, wait for available instance...", reqId)
+		s.waitedReq <- reqId
+		insReady := make(chan int)
+
+		go func() {
+			for element == nil {
+				s.insAvailable.Wait()
+				element = s.idleInstance.Front()
+			}
+			insReady <- 0
+		}()
+
+		select {
+		case <-ctx.Done():
 			return nil
-		} else {
-			s.logger.Printf("requestId=%s, wait for available instance...", request.RequestId)
-			s.waitedReq <- request
-			s.insAvailable.Wait()
+		case <-insReady:
 		}
 	}
 
 	instance := element.Value.(*model2.Instance)
+	s.logger.Printf("requestId=%s, assign instance=%s", reqId, instance.Id)
 	instance.Busy = true
 	s.idleInstance.Remove(element)
 	return instance
@@ -87,10 +102,10 @@ func (s *Adaptive) AddNewInstance(instance *model2.Instance) {
 	instance.Busy = false
 	instance.LastIdleTime = time.Now()
 	s.idleInstance.PushFront(instance)
-	s.insAvailable.Signal()
+	s.insAvailable.Broadcast()
 }
 
-func (s *Adaptive) CreateNewInstance(ctx context.Context, request *pb.AssignRequest) (ins *model2.Instance, err error) {
+func (s *Adaptive) CreateNewInstance(ctx context.Context, reqId string) (ins *model2.Instance, err error) {
 	defer func() {
 		if ins != nil {
 			s.logger.Printf("instance %s created, init latency: %dms", ins.Id, ins.InitDurationInMs)
@@ -98,22 +113,22 @@ func (s *Adaptive) CreateNewInstance(ctx context.Context, request *pb.AssignRequ
 	}()
 	resourceConfig := model2.SlotResourceConfig{
 		ResourceConfig: pb.ResourceConfig{
-			MemoryInMegabytes: request.MetaData.MemoryInMb,
+			MemoryInMegabytes: s.metaData.MemoryInMb,
 		},
 	}
-	slot, err := s.platformClient.CreateSlot(ctx, request.RequestId, &resourceConfig)
+	slot, err := s.platformClient.CreateSlot(ctx, reqId, &resourceConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create slot failed with: %s", err.Error())
 	}
 
 	meta := &model2.Meta{
 		Meta: pb.Meta{
-			Key:           request.MetaData.Key,
-			Runtime:       request.MetaData.Runtime,
-			TimeoutInSecs: request.MetaData.TimeoutInSecs,
+			Key:           s.metaData.Key,
+			Runtime:       s.metaData.Runtime,
+			TimeoutInSecs: s.metaData.TimeoutInSecs,
 		},
 	}
-	instance, err := s.platformClient.Init(ctx, request.RequestId, uuid.New().String(), slot, meta)
+	instance, err := s.platformClient.Init(ctx, reqId, uuid.New().String(), slot, meta)
 	if err != nil {
 		return nil, fmt.Errorf("create instance failed with: %s", err.Error())
 	}
@@ -121,7 +136,7 @@ func (s *Adaptive) CreateNewInstance(ctx context.Context, request *pb.AssignRequ
 	return instance, nil
 }
 
-func (s *Adaptive) Assign(_ context.Context, request *pb.AssignRequest) (rst *pb.AssignReply, err error) {
+func (s *Adaptive) Assign(ctx context.Context, request *pb.AssignRequest) (rst *pb.AssignReply, err error) {
 	start := time.Now()
 	defer func() {
 		instanceId := ""
@@ -130,20 +145,20 @@ func (s *Adaptive) Assign(_ context.Context, request *pb.AssignRequest) (rst *pb
 		}
 		s.logger.Printf("Finish Assign, requestId=%s, instanceId=%s, cost=%dms", request.RequestId, instanceId, time.Since(start).Milliseconds())
 	}()
-	s.logger.Printf("Start Assign, requestId=%s,idleInstance=%d", request.RequestId, s.idleInstance.Len())
+	s.logger.Printf("Start Assign, requestId=%s, idleInstance=%d", request.RequestId, s.idleInstance.Len())
 	s.runningIns.Add(1)
-	if idle := s.PopIdleInstance(request, true); idle != nil {
+	if ins := s.PopIdleInstance(ctx, request.RequestId); ins != nil {
 		return &pb.AssignReply{
 			Status: pb.Status_Ok,
 			Assigment: &pb.Assignment{
 				RequestId:  request.RequestId,
-				MetaKey:    idle.Meta.Key,
-				InstanceId: idle.Id,
+				MetaKey:    ins.Meta.Key,
+				InstanceId: ins.Id,
 			},
 			ErrorMessage: nil,
 		}, nil
 	} else {
-		return nil, status.Errorf(codes.Internal, fmt.Sprintf("can't get available instance"))
+		return nil, status.Errorf(codes.Canceled, "context canceled")
 	}
 }
 
@@ -193,7 +208,7 @@ func (s *Adaptive) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleR
 		instance.LastIdleTime = time.Now()
 		instance.Busy = false
 		s.idleInstance.PushFront(instance)
-		s.insAvailable.Signal()
+		s.insAvailable.Broadcast()
 		return nil
 	}(); err != nil {
 		return nil, err
@@ -209,7 +224,7 @@ func (s *Adaptive) deleteSlot(ctx context.Context, requestId, slotId, instanceId
 	}
 }
 
-func (s *Adaptive) gcInstance() {
+func (s *Adaptive) insGC() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if element := s.idleInstance.Back(); element != nil {
@@ -231,28 +246,51 @@ func (s *Adaptive) gcInstance() {
 	}
 }
 
-func (s *Adaptive) instanceAdaptLoop() {
-	s.logger.Printf("instance adapt loop started", s.metaData.Key)
+func (s *Adaptive) insAdaptLoop() {
+	s.logger.Printf("instance adapt loop started")
 	ticker := time.NewTicker(s.config.GcInterval)
 	for {
 		select {
 		case <-ticker.C:
-			s.gcInstance()
+			s.insGC()
 		case req := <-s.waitedReq:
-			s.mu.Lock()
-			targetIdleIns := int(math.Ceil(float64(s.runningIns.Load()) * s.config.IdlePct))
-			needCreate := targetIdleIns - s.idleInstance.Len()
-			s.mu.Unlock()
-			for i := 0; i < needCreate; i++ {
-				go func() {
-					instance, err := s.CreateNewInstance(context.Background(), req)
-					if err != nil {
-						s.logger.Printf("requestId=%s, create instance failed, err=%s", req.RequestId, err.Error())
-						return
-					}
+			pending := 0
+			resChan := make(chan *model2.Instance, 1)
+			adjustInstance := func() int {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				targetIns := int(math.Ceil(float64(s.runningIns.Load()) * (1 + s.config.IdlePct)))
+				needCreate := targetIns - len(s.instances) - pending
+				if needCreate <= 0 {
+					return 0
+				}
+				s.logger.Printf("Start CreateNewInstance, requestId=%s, targetIns=%d, pending=%d, needCreate=%d", req, targetIns, pending, needCreate)
+				for i := 0; i < needCreate; i++ {
+					go func() {
+						ins, err := s.CreateNewInstance(context.Background(), req)
+						if err != nil {
+							resChan <- nil
+							s.logger.Printf("requestId=%s, create instance failed, err=%s", req, err.Error())
+							return
+						}
 
-					s.AddNewInstance(instance)
-				}()
+						resChan <- ins
+					}()
+				}
+
+				return needCreate
+			}
+			pending += adjustInstance()
+
+			for pending > 0 {
+				select {
+				case req = <-s.waitedReq:
+					pending += adjustInstance()
+				case ins := <-resChan:
+					pending--
+					s.AddNewInstance(ins)
+					s.logger.Printf("Add new instance %s(slot=%s)", ins.Id, ins.Slot.Id)
+				}
 			}
 		}
 	}
