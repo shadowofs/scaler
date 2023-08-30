@@ -19,14 +19,14 @@ type Config struct {
 	ClientAddr           string
 	GcInterval           time.Duration
 	IdleDurationBeforeGC time.Duration
-	BatchSize            int
-	IdlePct              float64
+	BufferSize           int
+	MaxIdleIns           int
 }
 
 var DefaultConfig = Config{
 	ClientAddr:           "127.0.0.1:50051",
 	GcInterval:           10 * time.Second,
 	IdleDurationBeforeGC: 5 * time.Minute,
-	BatchSize:            2,
-	IdlePct:              0.1,
+	BufferSize:           2,
+	MaxIdleIns:           3,
 }
