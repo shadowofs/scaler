@@ -57,7 +57,7 @@ var _ = Describe("Assign instance", func() {
 		}, SpecTimeout(time.Second))
 	})
 
-	When("concurrent request arrive", func() {
+	When("concurrent requests arrive", func() {
 		It("should work", func(ctx context.Context) {
 			concurrency := 10
 			res := make(chan error, 1)

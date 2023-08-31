@@ -28,7 +28,7 @@ type Adaptive struct {
 	insAvailable   *sync.Cond
 	idleInstance   *list.List
 	waitedReq      chan string
-	waitedNum      util.AtomicInt32
+	waitedReqNum   util.AtomicInt32
 	logger         *log.Logger
 }
 
@@ -69,8 +69,8 @@ func (s *Adaptive) PopIdleInstance(ctx context.Context, reqId string) *model2.In
 	element := s.idleInstance.Front()
 
 	if element == nil {
-		s.waitedNum.Add(1)
-		defer s.waitedNum.Add(-1)
+		s.waitedReqNum.Add(1)
+		defer s.waitedReqNum.Add(-1)
 		s.waitedReq <- reqId
 		insReady := make(chan int, 0)
 
@@ -93,39 +93,24 @@ func (s *Adaptive) PopIdleInstance(ctx context.Context, reqId string) *model2.In
 	s.idleInstance.Remove(element)
 	instance := element.Value.(*model2.Instance)
 	instance.Busy = true
-	s.logger.Printf("requestId=%s, assign instance=%s", reqId, instance.Id)
+	//s.logger.Printf("requestId=%s, assign instance=%s", reqId, instance.Id)
 	return instance
 }
 
-func (s *Adaptive) AddIdleInstance(instance *model2.Instance) (destroy bool) {
-	defer func() {
-		if destroy {
-			s.deleteSlot(context.Background(), uuid.New().String(), instance.Slot.Id, instance.Id, "too many idle instance")
-		}
-	}()
-
+func (s *Adaptive) AddNewInstance(instance *model2.Instance) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	destroy = s.waitedNum.Load() == 0 &&
-		s.idleInstance.Len() >= s.config.ColdStartBufferSize && s.idleInstance.Len() >= int(s.waitedNum.Max())
-	if destroy {
-		delete(s.instances, instance.Id)
-		return
-	}
-
-	s.logger.Printf("Add new idle instance %s(slot=%s)", instance.Id, instance.Slot.Id)
 	s.instances[instance.Id] = instance
 	instance.Busy = false
 	instance.LastIdleTime = time.Now()
 	s.idleInstance.PushFront(instance)
 	s.insAvailable.Broadcast()
-	return
 }
 
 func (s *Adaptive) CreateNewInstance(ctx context.Context, reqId string) (ins *model2.Instance, err error) {
 	defer func() {
 		if ins != nil {
-			s.logger.Printf("instance %s created, init latency: %dms", ins.Id, ins.InitDurationInMs)
+			s.logger.Printf("instance %s created, init latency=%dms, reqId=%s", ins.Id, ins.InitDurationInMs, reqId)
 		}
 	}()
 	resourceConfig := model2.SlotResourceConfig{
@@ -156,13 +141,13 @@ func (s *Adaptive) CreateNewInstance(ctx context.Context, reqId string) (ins *mo
 func (s *Adaptive) Assign(ctx context.Context, request *pb.AssignRequest) (rst *pb.AssignReply, err error) {
 	start := time.Now()
 	defer func() {
-		instanceId := ""
-		if rst != nil {
-			instanceId = rst.Assigment.InstanceId
+		if err != nil {
+			s.logger.Printf("Assign Error, requestId=%s, error=%s", request.RequestId, err)
+		} else {
+			s.logger.Printf("Assign, requestId=%s, instanceId=%s, cost=%dms", request.RequestId, rst.Assigment.InstanceId, time.Since(start).Milliseconds())
 		}
-		s.logger.Printf("Finish Assign, requestId=%s, instanceId=%s, cost=%dms", request.RequestId, instanceId, time.Since(start).Milliseconds())
 	}()
-	s.logger.Printf("Start Assign, requestId=%s, idleInstance=%d", request.RequestId, s.idleInstance.Len())
+	//s.logger.Printf("Start Assign, requestId=%s, idleInstance=%d", request.RequestId, s.idleInstance.Len())
 	var ins *model2.Instance
 	if ins = s.PopIdleInstance(ctx, request.RequestId); ins == nil {
 		return nil, status.Errorf(codes.Canceled, "context canceled")
@@ -179,24 +164,55 @@ func (s *Adaptive) Assign(ctx context.Context, request *pb.AssignRequest) (rst *
 	}, nil
 }
 
-func (s *Adaptive) Idle(_ context.Context, request *pb.IdleRequest) (*pb.IdleReply, error) {
+func (s *Adaptive) Idle(ctx context.Context, request *pb.IdleRequest) (reply *pb.IdleReply, err error) {
 	if request.Assigment == nil {
 		return nil, status.Errorf(codes.InvalidArgument, fmt.Sprintf("assignment is nil"))
 	}
 	start := time.Now()
 	instanceId := request.Assigment.InstanceId
 	destroyed := false
+	reason := ""
 	var instance *model2.Instance
 
 	defer func() {
-		s.logger.Printf("Idle, request id: %s, instance: %s, destroy: %v, cost %dus", request.Assigment.RequestId, instanceId, destroyed, time.Since(start).Microseconds())
+		if err != nil {
+			s.logger.Printf("Idle Error, requestId: %s, err=%v", request.Assigment.RequestId, err)
+		} else {
+			s.logger.Printf("Idle, requestId: %s, instanceId=%s, destroy=%v, reason=%s, cost=%dus",
+				request.Assigment.RequestId, instanceId, destroyed, reason, time.Since(start).Microseconds())
+		}
 	}()
 
-	instance = s.getInstance(instanceId)
+	defer func() {
+		if destroyed {
+			s.deleteSlot(ctx, uuid.New().String(), instance.Slot.Id, instance.Id, reason)
+		}
+	}()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	instance = s.instances[instanceId]
 	if instance == nil {
 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("request id %s, instance %s not found", request.Assigment.RequestId, instanceId))
 	}
-	destroyed = s.AddIdleInstance(instance)
+
+	if request.Result != nil && request.Result.NeedDestroy != nil && *request.Result.NeedDestroy {
+		reason = "bad instance"
+		destroyed = true
+	} else if s.waitedReqNum.Load() == 0 &&
+		s.idleInstance.Len() >= util.Max(s.config.ColdStartBufferSize, int(s.waitedReqNum.Max())) {
+		reason = "too many idle instance"
+		destroyed = true
+	}
+
+	if destroyed {
+		delete(s.instances, instance.Id)
+	} else {
+		instance.Busy = true
+		instance.LastIdleTime = time.Now()
+		s.idleInstance.PushFront(instance)
+		s.insAvailable.Broadcast()
+	}
 
 	return &pb.IdleReply{
 		Status:       pb.Status_Ok,
@@ -214,7 +230,7 @@ func (s *Adaptive) Stats() Stats {
 }
 
 func (s *Adaptive) deleteSlot(ctx context.Context, requestId, slotId, instanceId, reason string) {
-	s.logger.Printf("start delete Instance %s (Slot: %s), reason: %s", instanceId, slotId, reason)
+	//s.logger.Printf("start delete Instance %s (Slot: %s), reason: %s", instanceId, slotId, reason)
 	if err := s.platformClient.DestroySLot(ctx, requestId, slotId, reason); err != nil {
 		s.logger.Printf("delete Instance %s (Slot: %s) failed with: %s", instanceId, slotId, err.Error())
 	}
@@ -242,7 +258,7 @@ func (s *Adaptive) insGC() {
 }
 
 func (s *Adaptive) adapterLoop() {
-	s.logger.Printf("instance adapt loop started")
+	//s.logger.Printf("instance adapt loop started")
 	ticker := time.NewTicker(s.config.GcInterval)
 	pending := 0
 	resChan := make(chan int, 0)
@@ -254,23 +270,15 @@ func (s *Adaptive) adapterLoop() {
 			s.insGC()
 		case reqId := <-s.waitedReq:
 			adjustInstanceNum := func(reqId string) int {
-				createNum := int(s.waitedNum.Load()) + s.config.ColdStartBufferSize - pending
+				createNum := int(s.waitedReqNum.Load()) + s.config.ColdStartBufferSize - pending
 				if createNum <= 0 {
 					return 0
 				}
-				s.logger.Printf("Start CreateNewInstance, requestId=%s, pending=%d, createNum=%d", reqId, pending, createNum)
+				//s.logger.Printf("Start CreateNewInstance, requestId=%s, pending=%d, createNum=%d", reqId, pending, createNum)
 				for i := 0; i < createNum; i++ {
 					go func() {
 						var ins *model2.Instance
 						var err error
-						defer func() {
-							if r := recover(); r != nil {
-								// this happened when request ctx canceled and closed channel
-								if ins != nil {
-									s.AddIdleInstance(ins)
-								}
-							}
-						}()
 
 						ins, err = s.CreateNewInstance(context.Background(), reqId)
 						if err != nil {
@@ -279,7 +287,7 @@ func (s *Adaptive) adapterLoop() {
 							return
 						}
 
-						s.AddIdleInstance(ins)
+						s.AddNewInstance(ins)
 						resChan <- 0
 					}()
 				}
@@ -298,16 +306,4 @@ func (s *Adaptive) adapterLoop() {
 			}
 		}
 	}
-}
-
-func (s *Adaptive) getInstance(insId string) *model2.Instance {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.instances[insId]
-}
-
-func (s *Adaptive) addInstance(ins *model2.Instance) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.instances[ins.Id] = ins
 }
