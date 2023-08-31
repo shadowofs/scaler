@@ -13,12 +13,12 @@ import (
 	"time"
 )
 
-var _ = Describe("Assign instance", Ordered, func() {
+var _ = Describe("Assign instance", func() {
 	var cfg *config.Config
 	var scaler scaler2.Scaler
 	var createDurationMs = 10
 
-	BeforeAll(func() {
+	BeforeEach(func() {
 		cfg = &config.DefaultConfig
 		metaData := &model.Meta{
 			Meta: pb.Meta{
@@ -44,26 +44,40 @@ var _ = Describe("Assign instance", Ordered, func() {
 			Expect(ins).NotTo(BeNil())
 			time.Sleep(time.Millisecond * time.Duration(createDurationMs))
 			stats = scaler.Stats()
-			Expect(stats.TotalIdleInstance).To(Equal(cfg.BufferSize))
+			Expect(stats.TotalIdleInstance).To(Equal(cfg.ColdStartBufferSize))
+
+			req = &pb.AssignRequest{
+				RequestId: uuid.New().String(),
+			}
+			ins, err = scaler.Assign(ctx, req)
+			Expect(err).To(BeNil())
+			Expect(ins).NotTo(BeNil())
+			stats = scaler.Stats()
+			Expect(stats.TotalIdleInstance).To(Equal(cfg.ColdStartBufferSize - 1))
 		}, SpecTimeout(time.Second))
 	})
 
-	When("idle instance available", func() {
-		BeforeEach(func() {
-			stats := scaler.Stats()
-			Expect(stats.TotalIdleInstance).To(Equal(cfg.BufferSize))
-		})
-
-		It("should use idle instance", func(ctx context.Context) {
-			req := &pb.AssignRequest{
-				RequestId: uuid.New().String(),
+	When("concurrent request arrive", func() {
+		It("should work", func(ctx context.Context) {
+			concurrency := 10
+			res := make(chan error, 1)
+			for i := 0; i < concurrency; i++ {
+				go func() {
+					req := &pb.AssignRequest{
+						RequestId: uuid.New().String(),
+					}
+					_, err := scaler.Assign(ctx, req)
+					res <- err
+				}()
 			}
-			ins, err := scaler.Assign(ctx, req)
-			Expect(err).To(BeNil())
-			Expect(ins).NotTo(BeNil())
+
+			for i := 0; i < concurrency; i++ {
+				Expect(<-res).To(BeNil())
+			}
+			time.Sleep(time.Millisecond * time.Duration(createDurationMs))
 			stats := scaler.Stats()
-			Expect(stats.TotalIdleInstance).To(Equal(cfg.BufferSize - 1))
-		}, SpecTimeout(time.Second))
+			Expect(stats.TotalInstance).To(Equal(cfg.ColdStartBufferSize + concurrency))
+		}, SpecTimeout(time.Second*10))
 	})
 })
 
@@ -73,7 +87,7 @@ var _ = Describe("Idle instance", func() {
 	cfg := config.DefaultConfig
 
 	BeforeEach(func() {
-		cfg.BufferSize = 0
+		cfg.ColdStartBufferSize = 0
 		metaData := &model.Meta{
 			Meta: pb.Meta{
 				Key:           "test",

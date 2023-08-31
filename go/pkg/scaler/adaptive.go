@@ -25,15 +25,11 @@ type Adaptive struct {
 	platformClient platform_client2.Client
 	mu             *sync.Mutex
 	instances      map[string]*model2.Instance
+	insAvailable   *sync.Cond
 	idleInstance   *list.List
-	waitedReq      chan *reqContext
+	waitedReq      chan string
 	waitedNum      util.AtomicInt32
 	logger         *log.Logger
-}
-
-type reqContext struct {
-	id      string
-	resChan chan<- *model2.Instance
 }
 
 func New(metaData *model2.Meta, config *config.Config) Scaler {
@@ -53,8 +49,9 @@ func NewWithClient(metaData *model2.Meta, config *config.Config, client platform
 		platformClient: client,
 		mu:             &lock,
 		instances:      make(map[string]*model2.Instance),
+		insAvailable:   sync.NewCond(&lock),
 		idleInstance:   list.New(),
-		waitedReq:      make(chan *reqContext, 1),
+		waitedReq:      make(chan string, 1),
 		logger:         log.New(os.Stdout, fmt.Sprintf("app=%s, ", metaData.Key), log.Ldate|log.Ltime|log.Lshortfile|log.Lmsgprefix),
 	}
 	log.Printf("New scaler for app: %s is created", metaData.Key)
@@ -66,37 +63,37 @@ func NewWithClient(metaData *model2.Meta, config *config.Config, client platform
 	return scheduler
 }
 
-func (s *Adaptive) WaitNewInstance(ctx context.Context, reqId string) *model2.Instance {
-	s.logger.Printf("requestId=%s, wait for available instance...", reqId)
-	resChan := make(chan *model2.Instance)
-	defer close(resChan)
-	reqCtx := reqContext{reqId, resChan}
-	s.waitedNum.Add(1)
-	defer s.waitedNum.Add(-1)
-	s.waitedReq <- &reqCtx
-
-	select {
-	case <-ctx.Done():
-		return nil
-	case ins := <-resChan:
-		ins.Busy = true
-		return ins
-	}
-}
-
-func (s *Adaptive) PopIdleInstance(reqId string) *model2.Instance {
+func (s *Adaptive) PopIdleInstance(ctx context.Context, reqId string) *model2.Instance {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	element := s.idleInstance.Front()
-	s.mu.Unlock()
 
 	if element == nil {
-		return nil
+		s.waitedNum.Add(1)
+		defer s.waitedNum.Add(-1)
+		s.waitedReq <- reqId
+		insReady := make(chan int, 0)
+
+		go func() {
+			for element == nil {
+				s.insAvailable.Wait()
+				element = s.idleInstance.Front()
+			}
+			insReady <- 0
+		}()
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-insReady:
+			// move on
+		}
 	}
 
-	instance := element.Value.(*model2.Instance)
-	s.logger.Printf("requestId=%s, assign instance=%s", reqId, instance.Id)
-	instance.Busy = true
 	s.idleInstance.Remove(element)
+	instance := element.Value.(*model2.Instance)
+	instance.Busy = true
+	s.logger.Printf("requestId=%s, assign instance=%s", reqId, instance.Id)
 	return instance
 }
 
@@ -109,7 +106,8 @@ func (s *Adaptive) AddIdleInstance(instance *model2.Instance) (destroy bool) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	destroy = s.idleInstance.Len() >= s.config.MaxIdleIns
+	destroy = s.waitedNum.Load() == 0 &&
+		s.idleInstance.Len() >= s.config.ColdStartBufferSize && s.idleInstance.Len() >= int(s.waitedNum.Max())
 	if destroy {
 		delete(s.instances, instance.Id)
 		return
@@ -120,6 +118,7 @@ func (s *Adaptive) AddIdleInstance(instance *model2.Instance) (destroy bool) {
 	instance.Busy = false
 	instance.LastIdleTime = time.Now()
 	s.idleInstance.PushFront(instance)
+	s.insAvailable.Broadcast()
 	return
 }
 
@@ -165,10 +164,8 @@ func (s *Adaptive) Assign(ctx context.Context, request *pb.AssignRequest) (rst *
 	}()
 	s.logger.Printf("Start Assign, requestId=%s, idleInstance=%d", request.RequestId, s.idleInstance.Len())
 	var ins *model2.Instance
-	if ins = s.PopIdleInstance(request.RequestId); ins == nil {
-		if ins = s.WaitNewInstance(ctx, request.RequestId); ins == nil {
-			return nil, status.Errorf(codes.Canceled, "context canceled")
-		}
+	if ins = s.PopIdleInstance(ctx, request.RequestId); ins == nil {
+		return nil, status.Errorf(codes.Canceled, "context canceled")
 	}
 
 	return &pb.AssignReply{
@@ -217,7 +214,7 @@ func (s *Adaptive) Stats() Stats {
 }
 
 func (s *Adaptive) deleteSlot(ctx context.Context, requestId, slotId, instanceId, reason string) {
-	s.logger.Printf("start delete Instance %s (Slot: %s)", instanceId, slotId)
+	s.logger.Printf("start delete Instance %s (Slot: %s), reason: %s", instanceId, slotId, reason)
 	if err := s.platformClient.DestroySLot(ctx, requestId, slotId, reason); err != nil {
 		s.logger.Printf("delete Instance %s (Slot: %s) failed with: %s", instanceId, slotId, err.Error())
 	}
@@ -255,15 +252,15 @@ func (s *Adaptive) adapterLoop() {
 		select {
 		case <-ticker.C:
 			s.insGC()
-		case reqCtx := <-s.waitedReq:
-			adjustInstanceNum := func() int {
-				createNum := int(s.waitedNum.Load()) + s.config.BufferSize - pending
+		case reqId := <-s.waitedReq:
+			adjustInstanceNum := func(reqId string) int {
+				createNum := int(s.waitedNum.Load()) + s.config.ColdStartBufferSize - pending
 				if createNum <= 0 {
 					return 0
 				}
-				s.logger.Printf("Start CreateNewInstance, requestId=%s, pending=%d, createNum=%d", reqCtx.id, pending, createNum)
+				s.logger.Printf("Start CreateNewInstance, requestId=%s, pending=%d, createNum=%d", reqId, pending, createNum)
 				for i := 0; i < createNum; i++ {
-					go func(addIdle bool) {
+					go func() {
 						var ins *model2.Instance
 						var err error
 						defer func() {
@@ -275,31 +272,26 @@ func (s *Adaptive) adapterLoop() {
 							}
 						}()
 
-						ins, err = s.CreateNewInstance(context.Background(), reqCtx.id)
+						ins, err = s.CreateNewInstance(context.Background(), reqId)
 						if err != nil {
-							s.logger.Printf("requestId=%s, create instance failed, err=%s", reqCtx.id, err.Error())
+							s.logger.Printf("requestId=%s, create instance failed, err=%s", reqId, err.Error())
 							resChan <- 0
 							return
 						}
 
-						if addIdle {
-							s.AddIdleInstance(ins)
-						} else {
-							s.addInstance(ins)
-							reqCtx.resChan <- ins
-						}
+						s.AddIdleInstance(ins)
 						resChan <- 0
-					}(i != 0)
+					}()
 				}
 
 				return createNum
 			}
 
-			pending += adjustInstanceNum()
+			pending += adjustInstanceNum(reqId)
 			for pending > 0 {
 				select {
-				case reqCtx = <-s.waitedReq:
-					pending += adjustInstanceNum()
+				case reqId = <-s.waitedReq:
+					pending += adjustInstanceNum(reqId)
 				case <-resChan:
 					pending--
 				}
